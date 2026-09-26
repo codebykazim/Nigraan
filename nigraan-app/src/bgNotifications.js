@@ -1,0 +1,215 @@
+import { Platform } from 'react-native';
+import { loadSession } from './api';
+import { presentAlarm } from './alarm';
+import { sendEmergencyAlarmIfNothingShown } from './notifications';
+
+/**
+ * The killed-app half of N3.3.
+ *
+ * `presentAlarm` needs JavaScript to be running, and the case the whole feature
+ * exists for -- the family's phone locked on a bedside table, the app killed by
+ * Android hours ago -- is exactly the case where it is not. A data-only push is
+ * the one thing that starts it: Android hands the message to the app, Expo
+ * spins up a headless JS runtime, this task runs, and it fires the full-screen
+ * intent from there.
+ *
+ * Two constraints came out of the SDK 57 docs and shape everything below:
+ *
+ *   - Only a push carrying `data` and *no* `title`/`body` reaches this task
+ *     when the app is terminated. A normal push with a title is shown by the
+ *     system and the task is not run. That is why the server sends **two**
+ *     pushes for a severity-4-or-worse alert (`nigraan_server.py`): a visible
+ *     one, which guarantees something appears even if this path fails, and a
+ *     silent one, which is what actually wakes the siren.
+ *
+ *   - "The OS may decide not to deliver the notification to your app in some
+ *     cases", Doze being the usual one. So this is an upgrade to the push path,
+ *     never a replacement for it. If it does not run, the visible notification
+ *     is still sitting there to be tapped, and the tap routing added on
+ *     26 Aug 2026 still opens the right alert.
+ *
+ * `defineTask` runs at module load, not inside `registerBackgroundNotifications`
+ * -- same reason as `bgService.js`: when Android relaunches the runtime
+ * headlessly, the task has to already be defined or the wake is wasted.
+ */
+
+const TASK_NAME = 'NIGRAAN_BACKGROUND_NOTIFICATION';
+
+let TaskManager = null;
+let Notifications = null;
+let loadError = null;
+
+try {
+  TaskManager = require('expo-task-manager');
+  Notifications = require('expo-notifications');
+} catch (e) {
+  loadError = e?.message || String(e);
+}
+
+let lastError = loadError;
+let lastFiredAt = null;
+let registered = false;
+
+export function backgroundNotificationDiagnostics() {
+  return { registered, lastFiredAt, lastError };
+}
+
+/**
+ * Dig the alert out of whatever shape the payload arrives in.
+ *
+ * Expo wraps the FCM message differently depending on platform and on whether
+ * the runtime was already alive, and the server spells the key `alert_id`
+ * while the app's own local notifications spell it `alertId`. Guessing wrong
+ * here means a silent push that wakes the phone and then does nothing, so all
+ * the known shapes are tried rather than one being assumed.
+ */
+function extractAlert(payload) {
+  const candidates = [];
+
+  // The shape that matters, and the one this originally missed.
+  //
+  // For a *headless* background notification -- the killed-app case this whole
+  // file exists for -- expo-notifications' own `NotificationTaskPayload` says
+  // `notification` is null and the data payload arrives as a JSON **string** in
+  // `data.dataString`. Nothing in the SDK parses it for us. Android's
+  // NotificationSerializer writes it that way for anything sent through the
+  // Expo push service, because the FCM message's `body` key holds the data as
+  // JSON rather than as fields.
+  for (const s of [
+    payload?.data?.dataString,
+    payload?.notification?.request?.content?.dataString,
+  ]) {
+    if (typeof s === 'string') {
+      try { candidates.push(JSON.parse(s)); } catch { /* not JSON after all */ }
+    }
+  }
+
+  // The already-running shapes, where the data survives as an object.
+  candidates.push(
+    payload?.notification?.request?.content?.data,
+    payload?.data?.notification?.request?.content?.data,
+    payload?.data?.notification?.data,
+    payload?.notification?.data,
+    payload?.data,
+    payload,
+  );
+
+  // Every candidate is tried for an alert id rather than the first non-null one
+  // being taken and trusted. That is the difference between this and the
+  // version it replaces: `payload.data` is *always* truthy, so a chain of `??`
+  // stopped there and reported "no alert" for every push a closed app ever got.
+  for (const d of candidates) {
+    if (!d || typeof d !== 'object') continue;
+    const id = d.alert_id ?? d.alertId;
+    if (id == null) continue;
+    return {
+      id,
+      severity: Number(d.severity ?? 0),
+      kind: d.kind || 'sos',
+      maps: d.maps || null,
+      user: { name: d.name || d.user_name || 'Family member' },
+    };
+  }
+  return null;
+}
+
+/*
+ * The floor under a takeover that did not happen is
+ * `sendEmergencyAlarmIfNothingShown`, which now lives in notifications.js.
+ *
+ * `presentAlarm` returning false means the native module was not in this
+ * binary, so all it managed was `Vibration.vibrate` -- and a vibration started
+ * from a headless task stops when Android tears that task down a few seconds
+ * later. Without the call below, the killed-app path could end in nothing at
+ * all, which is the one outcome the whole feature exists to prevent.
+ *
+ * It moved because guarding only this task was half a fix: the websocket path
+ * in App.js posted with no such check, so one alert arrived two and three times
+ * over whenever the app was open. One helper, used by both.
+ */
+
+if (TaskManager && Notifications) {
+  try {
+    TaskManager.defineTask(TASK_NAME, async ({ data, error }) => {
+      if (error) {
+        lastError = error.message || String(error);
+        return;
+      }
+      try {
+        // Nobody is signed in on this phone, so this push is for an account
+        // that has left it. Checked here rather than only at sign-out because
+        // sign-out is allowed to happen with no network: if the DELETE never
+        // reached the server, this is the only thing standing between a stale
+        // registration and what follows -- a full-screen, DND-bypassing siren
+        // for somebody else's emergency, on a phone showing a login screen.
+        const session = await loadSession();
+        if (!session?.token) return;
+        const alert = extractAlert(data);
+        // Anything below severity 4 is informational. Taking the screen over
+        // for a low-battery notice is how a family learns to swipe the
+        // takeover away without reading it.
+        if (!alert || alert.severity < 4) return;
+        lastFiredAt = Date.now();
+        if (await presentAlarm(alert)) return;
+        await sendEmergencyAlarmIfNothingShown(alert);
+      } catch (e) {
+        lastError = e?.message || String(e);
+      }
+    });
+  } catch (e) {
+    lastError = e?.message || String(e);
+  }
+}
+
+/** Idempotent; safe to call on every session change. */
+export async function registerBackgroundNotifications() {
+  if (Platform.OS !== 'android') return false;
+  if (!TaskManager || !Notifications) {
+    lastError = loadError || 'expo-task-manager / expo-notifications not in this build';
+    return false;
+  }
+  try {
+    if (await TaskManager.isTaskRegisteredAsync(TASK_NAME)) {
+      registered = true;
+      return true;
+    }
+    await Notifications.registerTaskAsync(TASK_NAME);
+    registered = true;
+    lastError = null;
+    return true;
+  } catch (e) {
+    lastError = e?.message || String(e);
+    registered = false;
+    console.warn('[bgNotifications] registerTaskAsync failed —', lastError);
+    return false;
+  }
+}
+
+/**
+ * The other half of the above, for sign-out.
+ *
+ * Registration is what lets a silent push wake this app headlessly and take the
+ * screen over. Leaving it in place after sign-out meant a phone nobody was
+ * signed in on could still be woken by an alert for the account that left.
+ *
+ * Unlike the server call in `stopPushToThisPhone`, this needs no network, which
+ * is the point: it is the half of the fix that still works when somebody signs
+ * out on a dead connection.
+ *
+ * Idempotent, and safe on a phone where the task was never registered.
+ */
+export async function unregisterBackgroundNotifications() {
+  if (!TaskManager || !Notifications) return false;
+  try {
+    if (await TaskManager.isTaskRegisteredAsync(TASK_NAME)) {
+      await Notifications.unregisterTaskAsync(TASK_NAME);
+    }
+    registered = false;
+    lastError = null;
+    return true;
+  } catch (e) {
+    lastError = e?.message || String(e);
+    console.warn('[bgNotifications] unregisterTaskAsync failed —', lastError);
+    return false;
+  }
+}
