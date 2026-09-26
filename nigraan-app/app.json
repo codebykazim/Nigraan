@@ -74,7 +74,7 @@
           "isAndroidBackgroundLocationEnabled": true
         }
       ],
-      "./plugins/withNigraanAndroid",
+      "./plugins/withnigraanAndroid",
       "./plugins/withNativeModuleGuard",
       "expo-font",
       "expo-secure-store",
@@ -86,11 +86,10 @@
         }
       ]
     ],
-    "owner": "usmannaeem_84",
     "scheme": "nigraan",
     "extra": {
       "eas": {
-        "projectId": "c18f22b0-736b-4792-9177-a92b2098b2b8"
+        "projectId": "4fec48d1-2d52-4ad7-bef4-1cc03d3706e9"
       }
     }
   }
