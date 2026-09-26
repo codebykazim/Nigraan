@@ -1,0 +1,168 @@
+import React, { useState } from 'react';
+import { Linking, Modal, StyleSheet, Text, View } from 'react-native';
+import { C, S, T, fmtAgo } from '../theme';
+import { Banner, Button, Chip, Divider, Icon, Label, Txt } from '../ui';
+
+const KIND = { sos: 'An emergency', snatch: 'A wristband was torn off', fall: 'A fall' };
+
+/**
+ * How far away, in words, and never more precisely than the server knows.
+ *
+ * `distance_m` is null when the distance could not be measured. This used to
+ * read `a.distance_m < 100 ? 'a hundred' : a.distance_m`, which turned both a
+ * null (null < 100 is true in JS) and the server's old unknown-distance 0 into
+ * a confident "a hundred metres away" -- on an alert that was five kilometres
+ * off. A screen asking a stranger to walk toward an emergency must not invent
+ * the one number the decision rests on.
+ */
+function howFar(m) {
+  if (m == null) return 'nearby';
+  if (m >= 1000) return `about ${(m / 1000).toFixed(1)} km away`;
+  if (m < 50) return 'right next to you';
+  return `about ${m} metres away`;
+}
+
+/**
+ * U4.4 — a stranger nearby needs help.
+ *
+ * Two screens in one, and the order is the whole feature. Before "I'm going"
+ * the wearer is anonymous and the pin is snapped to a three-hundred-metre
+ * grid: enough to decide whether you are close enough to be useful, not
+ * enough to find anybody. Saying yes is what releases the name and the exact
+ * location, and it puts the responder's own name on the alert at the same
+ * moment (matrix #20).
+ *
+ * Declining is a full-width button, not a dismissable corner. Nobody should
+ * feel trapped by this screen.
+ */
+export default function SamaritanCall({ call: incoming, onRespond, onDismiss }) {
+  const [busy, setBusy] = useState(false);
+  const [revealed, setRevealed] = useState(null);
+  const [error, setError] = useState(null);
+
+  // This component stays mounted across separate SOS sessions (App.js always
+  // renders it, just with `call` toggling to null and back). Without this,
+  // `revealed` from a previously-accepted call survives into the next SOS and
+  // this screen opens straight to "You said you are going" instead of asking
+  // again -- the state belongs to one alert id, not to the wearer. Reset
+  // during render (not in an effect) so there is no frame where the stale
+  // screen is shown before it flips back to the ask screen.
+  const [lastId, setLastId] = useState(incoming?.id ?? null);
+  const incomingId = incoming?.id ?? null;
+  if (incomingId !== lastId) {
+    setLastId(incomingId);
+    setRevealed(null);
+    setError(null);
+    setBusy(false);
+  }
+
+  if (!incoming) return null;
+  const a = incoming;
+
+  const go = async () => {
+    setBusy(true); setError(null);
+    try {
+      setRevealed(await onRespond?.(a.id));
+    } catch (e) {
+      const msg = e.message || '';
+      setError(msg);
+      if (msg.toLowerCase().includes('stood down') || msg.toLowerCase().includes('410') || msg.toLowerCase().includes('not found')) {
+        setTimeout(() => {
+          onDismiss?.();
+        }, 1200);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal visible transparent={false} animationType="slide" onRequestClose={onDismiss}>
+      <View style={s.wrap}>
+        <View style={s.head}>
+          <Chip text="near you" tone={C.blue} icon="map-pin" />
+          <Text style={[T.meta, { color: C.faint }]}>{fmtAgo(a.created_at)}</Text>
+        </View>
+
+        <Txt variant="h1">
+          {KIND[a.kind] || 'An emergency'} was raised {howFar(a.distance_m)}
+        </Txt>
+
+        {revealed ? (
+          <>
+            <Banner tone={C.green} icon="user-check" title="You said you are going">
+              They and their family know you are coming.
+            </Banner>
+
+            <View style={s.detail}>
+              <Label>Who</Label>
+              <Txt variant="h2">{revealed.user?.name || 'Unknown'}</Txt>
+              <Divider />
+              <Label>Exact location</Label>
+              <Text style={[T.number, { color: C.text }]}>
+                {revealed.lat != null ? `${revealed.lat.toFixed(5)}, ${revealed.lon.toFixed(5)}` : 'not attached'}
+              </Text>
+              {revealed.accuracy ? (
+                <Text style={[T.meta, { color: C.faint }]}>
+                  accurate to about {Math.round(revealed.accuracy)} m
+                </Text>
+              ) : null}
+            </View>
+
+            {revealed.maps ? (
+              <Button title="OPEN DIRECTIONS" filled tone={C.blue} icon="navigation"
+                      onPress={() => Linking.openURL(revealed.maps)} />
+            ) : null}
+            <Button title="CLOSE" tone={C.dim} onPress={onDismiss} />
+          </>
+        ) : (
+          <>
+            <Text style={[T.body, { color: C.dim }]}>
+              You are being asked because you are close by. Nobody is named until
+              you say you are going — and then they see your name too.
+            </Text>
+
+            <View style={s.detail}>
+              <Label>Roughly where</Label>
+              <Text style={[T.number, { color: C.text }]}>
+                {a.lat != null && a.lon != null
+                  ? `${a.lat.toFixed(3)}, ${a.lon.toFixed(3)}`
+                  : 'Nearby area'}
+              </Text>
+              <Text style={[T.meta, { color: C.faint }]}>
+                Snapped to a 300 m grid until you respond.
+              </Text>
+            </View>
+
+            {a.maps ? (
+              <Button title="SEE THE AREA" tone={C.blue} icon="map"
+                      onPress={() => Linking.openURL(a.maps)} />
+            ) : null}
+
+
+            {error ? (
+              <View style={s.errRow}>
+                <Icon name="alert-circle" size={15} color={C.red} />
+                <Text style={[T.meta, { color: C.red, flex: 1 }]}>{error}</Text>
+              </View>
+            ) : null}
+
+            <View style={s.actions}>
+              <Button title="I'M GOING" filled big tone={C.green} icon="navigation"
+                      loading={busy} onPress={go} />
+              <Button title="I CAN'T HELP" tone={C.dim} onPress={onDismiss} />
+            </View>
+          </>
+        )}
+      </View>
+    </Modal>
+  );
+}
+
+const s = StyleSheet.create({
+  wrap: { flex: 1, backgroundColor: C.bg, padding: S.xl, gap: S.lg, justifyContent: 'center' },
+  head: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  detail: { backgroundColor: C.surface, borderRadius: 8, padding: S.lg, gap: S.sm },
+  errRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  actions: { gap: S.md, marginTop: S.sm },
+});
