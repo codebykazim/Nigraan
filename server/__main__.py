@@ -6,6 +6,8 @@ never prints anything. The banner is the only reason this file exists: the
 address it prints is the one that has to be typed into the phones.
 """
 
+import utils.transport
+import utils.session
 import json
 
 from server.app import app
