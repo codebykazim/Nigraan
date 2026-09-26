@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "902261731452",
+    "project_id": "an-50498",
+    "storage_bucket": "an-50498.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:902261731452:android:50057f0763888881cf19f9",
+        "android_client_info": {
+          "package_name": "com.nigraan.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBsYUJp0VM4NsKxTRvVR_XUyzvSg1wmlyo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
