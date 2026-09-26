@@ -1,0 +1,143 @@
+"""
+Check-ins: a question with a deadline the SERVER owns.
+"""
+
+import time
+from contextlib import closing
+
+from server.config import RESPONDER_CHANNEL_ID, SOS_SAFE_STREAK
+from server.db import db
+from server.hub import HUB
+from server.logging_setup import get_logger
+from server.push import send_expo_push_notifications
+from server.services.alerts import resolve_alert
+
+log = get_logger(__name__)
+
+
+#
+# A check-in is a question with a deadline attached, and the deadline lives
+# here. That is the whole point. The phone asks, the phone buzzes, the phone
+# answers -- but the phone does not decide when time is up, because the case
+# that matters is precisely the one where the phone is dead, off, taken, or
+# killed by an OEM battery manager.
+
+
+def open_checkin(c, uid):
+    """The oldest question this person still owes an answer to.
+
+    `escalated` first in the ordering, and it is not cosmetic. An escalated row
+    is a question whose deadline has already passed and whose family have
+    already been paged -- the sweeper latches `escalated` and does NOT set
+    `acked_at`, so the row goes on being open indefinitely. Ordered by `due_at`
+    alone, that dead row is always the oldest, so it masks every live question
+    behind it: a wearer with an unanswered fall gets the SOS's own five-minute
+    knock rendered as the fall from twenty minutes ago, and the family screen
+    counts down to a deadline that expired before they even opened the app.
+
+    Still returned when nothing live is waiting, which is the point of putting
+    it second rather than excluding it. Answering late is a real thing people
+    do, and it still means what it always meant.
+    """
+    return c.execute(
+        "SELECT * FROM checkins WHERE user_id=%s AND acked_at IS NULL "
+        "ORDER BY escalated, due_at LIMIT 1", (uid,)).fetchone()
+
+
+async def ack_open_checkins(uid, by="app"):
+    """Answer everything outstanding, and tell whoever asked.
+
+    Deliberately answers *all* of them rather than the oldest. If a parent
+    asked, and then High Alert asked again, one press of "I'm fine" means the
+    person is fine -- leaving a second question open so it can escalate ninety
+    seconds later would be a false alarm the product invented for itself.
+
+    It is also where an emergency can end. While an SOS is live the server asks
+    its own check-in every five minutes, and answering SOS_SAFE_STREAK of them
+    in a row stands the alert down -- the wearer saying "I am fine" twice, five
+    minutes apart, with the family already alerted. See the comment on the
+    streak below for why only the server's own questions are counted.
+    """
+    now = time.time()
+    with closing(db()) as c:
+        rows = c.execute("SELECT * FROM checkins WHERE user_id=%s AND acked_at IS NULL",
+                         (uid,)).fetchall()
+        if not rows:
+            return 0
+        c.execute("UPDATE checkins SET acked_at=%s WHERE user_id=%s AND acked_at IS NULL",
+                  (now, uid))
+
+        # The run of answers that ends an emergency.
+        #
+        # Only a question the SOS itself asked counts. A parent's "are you
+        # okay?" answered during an emergency is a kind thing and it is not
+        # evidence: it can be answered from anywhere, by anyone holding the
+        # phone, at a moment of the asker's choosing. What SOS_SAFE_STREAK is
+        # actually measuring is that this person was still able to answer five
+        # minutes after the last time they were -- so it has to be the
+        # server's own clock asking, twice, on its own schedule.
+        #
+        # `AND mode='sos'` is the guard that stops the count running against an
+        # emergency that has already ended: the wearer's own stand-down and
+        # this can land in either order, and incrementing a streak after the
+        # alert is resolved would leave a number sitting in the row waiting to
+        # end the NEXT emergency one answer early.
+        streak = None
+        if any(r["reason"] == "sos" for r in rows):
+            w = c.execute("UPDATE watch_state SET sos_streak=sos_streak+1"
+                          " WHERE user_id=%s AND mode='sos'"
+                          " RETURNING sos_streak", (uid,)).fetchone()
+            streak = w["sos_streak"] if w else None
+
+        c.commit()
+        u = c.execute("SELECT id,name FROM users WHERE id=%s", (uid,)).fetchone()
+        # Read on the same connection, before it goes back to the pool: the
+        # stand-down below needs an alert id, and this is the row the streak
+        # was just counted against.
+        live = None
+        if streak is not None and streak >= SOS_SAFE_STREAK:
+            live = c.execute(
+                "SELECT id FROM alerts WHERE user_id=%s AND resolved_at IS NULL"
+                " AND severity>=4 ORDER BY created_at DESC LIMIT 1", (uid,)).fetchone()
+
+    who = {"id": uid, "name": u["name"] if u else uid}
+
+    # Whoever asked, told once -- not once per open row. Two questions answered
+    # by one press of "I'm fine" is one piece of news, and the person who asked
+    # both should not get two identical popups for it.
+    asked_by = {r["asked_by"] for r in rows if r["asked_by"]}
+    for r in rows:
+        if r["asked_by"]:
+            await HUB.to(r["asked_by"], {"t": "checkin_ack", "checkin_id": r["id"],
+                                         "by": who, "reason": r["reason"]})
+
+    # The socket frame above only lands on an app that is open, and the person
+    # who asked "are you okay?" is exactly the person who put the phone back in
+    # their pocket to wait for the answer. Same reasoning as
+    # notify_owner_of_ack, and the same channel: it vibrates and stays silent,
+    # and severity 1 keeps it away from the siren and the takeover.
+    if asked_by:
+        await send_expo_push_notifications(
+            list(asked_by),
+            f"{who['name']} is fine",
+            "They answered your check-in.",
+            {"severity": 1, "t": "checkin_ack", "by": who["id"]},
+            channel=RESPONDER_CHANNEL_ID,
+            # An answer delivered half an hour late describes a worry that has
+            # already resolved itself one way or the other.
+            ttl=300,
+            sound=None)
+
+    # Two in a row, and the emergency is over.
+    #
+    # Deliberately last. Everything above is the answer being recorded and the
+    # person who asked being told, and none of it should be skipped because the
+    # stand-down failed -- an emergency that stays live one cycle longer is a
+    # recoverable state, and an answer that was never written down is not.
+    if live:
+        log.info("%s answered %d SOS check-ins in a row - standing the alert down",
+                 who["name"], SOS_SAFE_STREAK)
+        await resolve_alert(live["id"], uid, auto=True,
+                            note=f"answered {SOS_SAFE_STREAK} check-ins in a row")
+
+    return len(rows)
